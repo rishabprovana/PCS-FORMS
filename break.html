@@ -36,7 +36,7 @@
 // This uses a free Firebase Realtime Database as that shared backend.
 // Fill in DATABASE_URL after following the setup steps in README.md.
 // ─────────────────────────────────────────────────────────────────────────
-const DATABASE_URL = 'https://pcs-forms-matrix-default-rtdb.firebaseio.com; // ⚠️ was pointing at the Firebase Console page, not the database — fixed to the likely REST URL, but confirm it against the URL shown at the top of your Realtime Database page (it ends in .firebasedatabase.app instead if your database is regional)
+const DATABASE_URL = 'https://pcs-forms-matrix-default-rtdb.firebaseio.com'; // ⚠️ was pointing at the Firebase Console page, not the database — fixed to the likely REST URL, but confirm it against the URL shown at the top of your Realtime Database page (it ends in .firebasedatabase.app instead if your database is regional)
 const POLL_MS = 5000;
 const configured = DATABASE_URL && !DATABASE_URL.includes('https://pcs-forms-matrix-default-rtdb.firebaseio.com');
 
