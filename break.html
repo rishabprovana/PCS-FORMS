@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Team Break Board</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tabler-icons/2.44.0/iconfont/tabler-icons.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Oswald:wght@500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  html, body { margin:0; padding:0; background:#fdfcf9; }
+  #app { font-family: 'Inter', -apple-system, sans-serif; color: #26251f; max-width: 900px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  button { cursor: pointer; font-family: inherit; }
+  ::-webkit-scrollbar { height: 8px; width: 8px; }
+  ::-webkit-scrollbar-thumb { background: #c9c4b6; border-radius: 4px; }
+  .btn { padding:10px 18px; border-radius:8px; border:1px solid #d8d3c4; background:#fff; font-size:14px; font-weight:500; }
+  .btn:hover { background:#f7f5ef; }
+  .btn:active { transform: scale(0.98); }
+  .roster-row { cursor:pointer; }
+  .roster-row:hover { background:#f7f5ef; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<div id="app">
+  <p style="text-align:center; color:#8a8578; padding:2rem;" class="mono">Loading…</p>
+</div>
+
+<script>
+(function(){
+
+// ─────────────────────────────────────────────────────────────────────────
+// SHARED BACKEND CONFIG
+// GitHub Pages is static-only, so there's no server to hold shared state.
+// This uses a free Firebase Realtime Database as that shared backend.
+// Fill in DATABASE_URL after following the setup steps in README.md.
+// ─────────────────────────────────────────────────────────────────────────
+// ⚠️ Was pointing at the Firebase Console page, not the database — fixed to the
+// likely REST URL below, but confirm it against the URL shown at the top of your
+// Realtime Database page (it ends in .firebasedatabase.app instead if your database is regional).
+const DATABASE_URL = 'https://pcs-forms-matrix-default-rtdb.firebaseio.com';
+const POLL_MS = 5000;
+const configured = !!DATABASE_URL && DATABASE_URL !== 'PLACEHOLDER_URL';
+
+const LOG_CAP = 200;
+
+// Only a link in the form #board-<this value> opens the shared board.
+// Change this to your own private word, then bookmark that link for
+// yourself — never hand it out. Give employees ONLY their personal link
+// (see the "Show personal links to share" panel on the board).
+// Note: this keeps casual visitors out, it is not real login security —
+// anyone who views this page's source can still read the value below.
+const BOARD_KEY = '000000';
+
+const EMPLOYEES = [
+  { id: '112590', name: 'Arushi Sharma',    title: 'Business Analyst',    shift: '13:00–22:30', lunchAllowed: true },
+  { id: '113527', name: 'Asha Saroha',      title: 'Business Analyst',    shift: '13:00–22:30', lunchAllowed: true },
+  { id: '114492', name: 'Divya Chaudhary',  title: 'Business Analyst',    shift: '13:00–22:30', lunchAllowed: true },
+  { id: '114446', name: 'Janhvi Mishra',    title: 'Business Analyst',    shift: '12:00–21:30', lunchAllowed: true },
+  { id: '107718', name: 'Jatin Kumar',      title: 'Business Analyst',    shift: '13:00–22:30', lunchAllowed: true },
+  { id: '108395', name: 'Kartik Rastogi',   title: 'Business Analyst',    shift: '16:00–01:30', lunchAllowed: false },
+  { id: '108627', name: 'Kashish Chaudhary',title: 'Business Analyst',    shift: '12:00–21:30', lunchAllowed: true },
+  { id: '110092', name: 'Pawan Solanki',    title: 'Business Analyst',    shift: '15:00–00:30', lunchAllowed: true },
+  { id: '114408', name: 'Pratham Gaur',     title: 'Business Analyst',    shift: '12:00–21:30', lunchAllowed: true },
+  { id: '114300', name: 'Rachna Kamat',     title: 'Sr. Business Analyst',shift: '13:00–22:30', lunchAllowed: true },
+  { id: '114437', name: 'Richa Rai',        title: 'Business Analyst',    shift: '12:00–21:30', lunchAllowed: true },
+  { id: '105980', name: 'Rishab Verma',     title: 'Sr. Business Analyst',shift: '12:00–21:30', lunchAllowed: true }
+];
+
+const BREAK_TYPES = {
+  lunch:  { label: 'Lunch break',  mins: 30, color: '#993C1D', bg: '#FAECE7' },
+  dinner: { label: 'Dinner break', mins: 30, color: '#0F6E56', bg: '#E1F5EE' },
+  coffee: { label: 'Coffee break', mins: 15, color: '#BA7517', bg: '#FAEEDA' },
+  short:  { label: 'Short break',  mins: 10, color: '#534AB7', bg: '#EEEDFE' }
+};
+
+let data = { employees: {} };
+let loaded = false;
+let tickHandle = null;
+let pollHandle = null;
+const recentLocalWrites = {}; // empId -> timestamp of our last local start/stop, to avoid poll clobbering our own optimistic update
+
+function empById(id) { return EMPLOYEES.find(e => e.id === id); }
+function defaultRecord() { return { status: 'idle', breakType: null, startedAt: null, log: [] }; }
+
+function ensureRecord(id) {
+  if (!data.employees[id]) data.employees[id] = defaultRecord();
+  return data.employees[id];
+}
+
+// ── Storage layer ──────────────────────────────────────────────────────
+// If Firebase isn't configured yet, fall back to this browser's own
+// localStorage so the app is still usable for local testing (but won't
+// be shared across people until DATABASE_URL is set).
+function localGet(id) {
+  try {
+    const raw = localStorage.getItem('break-tracker:' + id);
+    return raw ? JSON.parse(raw) : defaultRecord();
+  } catch (e) { return defaultRecord(); }
+}
+function localSet(id, rec) {
+  try { localStorage.setItem('break-tracker:' + id, JSON.stringify(rec)); } catch (e) {}
+}
+
+function isValidRecord(json) {
+  return !!json && typeof json === 'object' && Array.isArray(json.log) && typeof json.status === 'string';
+}
+
+async function fetchRecord(id) {
+  if (!configured) return localGet(id);
+  try {
+    const res = await fetch(`${DATABASE_URL}/employees/${id}.json`);
+    const json = await res.json();
+    if (json === null) return defaultRecord();
+    if (!isValidRecord(json)) {
+      // Firebase returned something that isn't a real record - most likely
+      // {"error":"Permission denied"} because the database rules block
+      // public read/write. Don't let a bad shape crash rendering; fall
+      // back to a safe empty record instead.
+      console.error('Unexpected response for', id, json, '- check your Firebase Database Rules allow public read/write.');
+      return defaultRecord();
+    }
+    return json;
+  } catch (e) {
+    return null; // network error - keep whatever we already have locally
+  }
+}
+
+async function pushRecord(id, rec) {
+  if (!configured) { localSet(id, rec); return; }
+  try {
+    await fetch(`${DATABASE_URL}/employees/${id}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(rec)
+    });
+  } catch (e) {
+    console.error('save failed', e);
+  }
+}
+
+// Fetch every employee's record and merge into local state, but skip
+// records we ourselves just wrote to within the last 4s so a slow
+// round-trip / poll can't visually revert our own optimistic update.
+async function loadState() {
+  const results = await Promise.all(EMPLOYEES.map(async (e) => {
+    const rec = await fetchRecord(e.id);
+    return [e.id, rec];
+  }));
+  const now = Date.now();
+  results.forEach(([id, rec]) => {
+    if (rec === null) { ensureRecord(id); return; }
+    const recentlyTouchedLocally = recentLocalWrites[id] && (now - recentLocalWrites[id] < 4000);
+    if (recentlyTouchedLocally) return;
+    data.employees[id] = rec;
+  });
+  loaded = true;
+}
+
+async function saveRecord(id) {
+  recentLocalWrites[id] = Date.now();
+  await pushRecord(id, data.employees[id]);
+}
+
+async function refreshFromStorage() {
+  await loadState();
+  render();
+}
+
+function fmtElapsed(ms) {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+}
+
+function fmtClock(ts) {
+  const d = new Date(ts);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtDate(ts) {
+  return new Date(ts).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+async function startBreak(empId, type) {
+  const rec = ensureRecord(empId);
+  if (rec.status !== 'idle') return;
+  rec.status = 'onbreak';
+  rec.breakType = type;
+  rec.startedAt = Date.now();
+  await saveRecord(empId);
+  render();
+}
+
+async function stopBreak(empId) {
+  const rec = ensureRecord(empId);
+  if (rec.status !== 'onbreak') return;
+  const dur = Date.now() - rec.startedAt;
+  rec.log.unshift({ type: rec.breakType, start: rec.startedAt, end: Date.now(), durationMs: dur });
+  rec.log = rec.log.slice(0, LOG_CAP);
+  rec.status = 'idle';
+  rec.breakType = null;
+  rec.startedAt = null;
+  await saveRecord(empId);
+  render();
+}
+
+function getHashRoute() {
+  const h = (location.hash || '').replace('#', '').trim();
+  if (h === 'board-' + BOARD_KEY) return { view: 'board' };
+  if (h.startsWith('history-')) {
+    const emp = empById(h.slice('history-'.length));
+    if (emp) return { view: 'history', id: emp.id };
+    return { view: 'blocked' };
+  }
+  const emp = empById(h);
+  if (emp) return { view: 'personal', id: emp.id };
+  return { view: 'blocked' };
+}
+
+function personalUrl(id) {
+  return location.href.split('#')[0] + '#' + id;
+}
+
+function copyLink(url, btn) {
+  navigator.clipboard && navigator.clipboard.writeText(url).then(() => {
+    const orig = btn.innerHTML;
+    btn.textContent = 'Copied';
+    setTimeout(() => { btn.innerHTML = orig; }, 1200);
+  });
+}
+
+function configBanner() {
+  if (configured) return '';
+  return `<div style="background:#FAEEDA; border:1px solid #e8d3a0; color:#7a5b16; font-size:12px; padding:10px 14px; border-radius:8px; margin-bottom:1.25rem;">
+    <i class="ti ti-plug-connected-x" style="font-size:14px; vertical-align:-2px; margin-right:6px;"></i>
+    Not connected to a shared database yet — this browser is only showing local data that won't sync with your team.
+    See README.md to connect Firebase.
+  </div>`;
+}
+
+function renderBlocked() {
+  if (tickHandle) clearInterval(tickHandle);
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <div style="text-align:center; padding:5rem 1rem;">
+      <i class="ti ti-lock" style="font-size:26px; color:#c9c4b6;"></i>
+      <div style="font-family:'Oswald',sans-serif; font-size:18px; text-transform:uppercase; letter-spacing:0.3px; margin-top:14px;">Page not available</div>
+      <div style="font-size:13px; color:#8a8578; margin-top:6px;">Use the personal link you were given to open your break page.</div>
+    </div>`;
+}
+
+function renderPersonal(id) {
+  const emp = empById(id);
+  const rec = ensureRecord(id);
+  const app = document.getElementById('app');
+
+  let statusBlock = '';
+  if (rec.status === 'idle') {
+    let buttons = '';
+    Object.keys(BREAK_TYPES).forEach(key => {
+      if (key === 'lunch' && !emp.lunchAllowed) return;
+      const bt = BREAK_TYPES[key];
+      buttons += `<button class="btn start-btn" data-type="${key}" style="color:${bt.color}; border-color:${bt.color}40; margin-right:10px; margin-bottom:8px;"><i class="ti ti-player-play" style="font-size:15px; vertical-align:-2px; margin-right:6px;"></i>Start ${bt.label}</button>`;
+    });
+    statusBlock = `
+      <div style="padding:2rem 0;">
+        <div style="font-size:13px; color:#8a8578; margin-bottom:12px;" class="mono">Status: working</div>
+        <div>${buttons}</div>
+        ${!emp.lunchAllowed ? '<div style="font-size:12px; color:#a32d2d; margin-top:12px;"><i class="ti ti-info-circle" style="font-size:14px; vertical-align:-2px; margin-right:4px;"></i>Lunch break is not available for this role.</div>' : ''}
+      </div>`;
+  } else {
+    const bt = BREAK_TYPES[rec.breakType];
+    statusBlock = `
+      <div style="padding:2rem 0;">
+        <div style="font-size:13px; color:#8a8578; margin-bottom:6px;" class="mono">On ${bt.label.toLowerCase()} since ${fmtClock(rec.startedAt)}</div>
+        <div id="timer" data-started="${rec.startedAt}" data-limit="${bt.mins}" style="font-family:'Oswald',sans-serif; font-size:48px; margin:10px 0 20px;">00:00</div>
+        <button class="btn stop-btn" style="color:#a32d2d; border-color:#e2909040;"><i class="ti ti-player-stop" style="font-size:15px; vertical-align:-2px; margin-right:6px;"></i>Stop break</button>
+      </div>`;
+  }
+
+  const preview = rec.log.slice(0, 5);
+  let logRows = preview.map(l => {
+    const bt = BREAK_TYPES[l.type];
+    return `<tr>
+      <td style="padding:6px 10px; font-size:13px; color:${bt.color};">${bt.label}</td>
+      <td style="padding:6px 10px; font-size:13px;" class="mono">${fmtClock(l.start)} – ${fmtClock(l.end)}</td>
+      <td style="padding:6px 10px; font-size:13px; text-align:right;" class="mono">${fmtElapsed(l.durationMs)}</td>
+    </tr>`;
+  }).join('');
+
+  app.innerHTML = `
+    ${configBanner()}
+    <div style="font-family:'Oswald',sans-serif; font-size:22px; text-transform:uppercase; letter-spacing:0.3px; margin-top:6px;">${emp.name}</div>
+    <div style="font-size:13px; color:#8a8578;">${emp.title} · shift ${emp.shift}</div>
+    ${statusBlock}
+    ${rec.log.length ? `<div style="border-top:1px solid #ece7db; padding-top:12px; margin-top:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <div style="font-size:12px; color:#8a8578;">Recent breaks</div>
+        <a href="#history-${id}" style="font-size:12px; color:#5f5b4e;">View full history (${rec.log.length}) <i class="ti ti-chevron-right" style="font-size:11px; vertical-align:-1px;"></i></a>
+      </div>
+      <table style="width:100%; border-collapse:collapse;">${logRows}</table>
+    </div>` : `<div style="border-top:1px solid #ece7db; padding-top:12px; margin-top:8px; font-size:12px; color:#8a8578;">No breaks logged yet.</div>`}
+  `;
+
+  app.querySelectorAll('.start-btn').forEach(b => {
+    b.onclick = () => startBreak(id, b.getAttribute('data-type'));
+  });
+  const stopBtn = app.querySelector('.stop-btn');
+  if (stopBtn) stopBtn.onclick = () => stopBreak(id);
+
+  restartTicker();
+}
+
+function renderHistory(id) {
+  const emp = empById(id);
+  const rec = ensureRecord(id);
+  const app = document.getElementById('app');
+
+  let body;
+  if (!rec.log.length) {
+    body = `<div style="padding:2rem 0; font-size:13px; color:#8a8578;">No breaks logged yet.</div>`;
+  } else {
+    const groups = [];
+    rec.log.forEach(l => {
+      const dayLabel = fmtDate(l.start);
+      let group = groups.find(g => g.label === dayLabel);
+      if (!group) { group = { label: dayLabel, entries: [] }; groups.push(group); }
+      group.entries.push(l);
+    });
+
+    const totalsByType = {};
+    rec.log.forEach(l => { totalsByType[l.type] = (totalsByType[l.type] || 0) + l.durationMs; });
+
+    body = `
+      <div style="display:flex; gap:18px; flex-wrap:wrap; margin:1rem 0 1.5rem; padding:14px 16px; background:#f7f5ef; border-radius:10px;">
+        ${Object.keys(BREAK_TYPES).map(k => {
+          if (!totalsByType[k]) return '';
+          const bt = BREAK_TYPES[k];
+          return `<div>
+            <div style="font-size:11px; color:${bt.color}; font-weight:500;">${bt.label}</div>
+            <div class="mono" style="font-size:18px;">${fmtElapsed(totalsByType[k])}</div>
+          </div>`;
+        }).join('')}
+        <div>
+          <div style="font-size:11px; color:#8a8578; font-weight:500;">Total breaks</div>
+          <div class="mono" style="font-size:18px;">${rec.log.length}</div>
+        </div>
+      </div>
+      ${groups.map(g => `
+        <div style="margin-bottom:18px;">
+          <div style="font-size:12px; color:#8a8578; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.4px;" class="mono">${g.label}</div>
+          <table style="width:100%; border-collapse:collapse;">
+            ${g.entries.map(l => {
+              const bt = BREAK_TYPES[l.type];
+              return `<tr style="border-bottom:1px solid #ece7db;">
+                <td style="padding:7px 10px; font-size:13px; color:${bt.color};">${bt.label}</td>
+                <td style="padding:7px 10px; font-size:13px;" class="mono">${fmtClock(l.start)} – ${fmtClock(l.end)}</td>
+                <td style="padding:7px 10px; font-size:13px; text-align:right;" class="mono">${fmtElapsed(l.durationMs)}</td>
+              </tr>`;
+            }).join('')}
+          </table>
+        </div>
+      `).join('')}
+    `;
+  }
+
+  app.innerHTML = `
+    <div style="margin-bottom:6px;">
+      <a href="#${id}" style="font-size:12px; color:#8a8578; text-decoration:none;"><i class="ti ti-arrow-left" style="font-size:13px; vertical-align:-2px;"></i> ${emp.name}</a>
+    </div>
+    <div style="font-family:'Oswald',sans-serif; font-size:22px; text-transform:uppercase; letter-spacing:0.3px;">Break history</div>
+    <div style="font-size:13px; color:#8a8578;">${emp.name} · ${emp.title}</div>
+    ${body}
+  `;
+}
+
+function renderBoard() {
+  const app = document.getElementById('app');
+
+  let rows = EMPLOYEES.map(emp => {
+    const rec = ensureRecord(emp.id);
+    let statusCell, timeCell;
+    if (rec.status === 'idle') {
+      statusCell = `<span style="color:#5f5b4e;">Working</span>`;
+      timeCell = '';
+    } else {
+      const bt = BREAK_TYPES[rec.breakType];
+      statusCell = `<span style="color:${bt.color}; font-weight:500;">${bt.label}</span>`;
+      timeCell = `<span class="mono board-timer" data-started="${rec.startedAt}" data-limit="${bt.mins}" style="color:${bt.color};">00:00</span>`;
+    }
+    return `<tr class="roster-row" data-id="${emp.id}" style="border-bottom:1px solid #ece7db;">
+      <td style="padding:8px 10px; font-size:13px; font-weight:500;">${emp.name}</td>
+      <td style="padding:8px 10px; font-size:12px; color:#8a8578;">${emp.title}</td>
+      <td style="padding:8px 10px; font-size:12px; color:#8a8578;" class="mono">${emp.shift}</td>
+      <td style="padding:8px 10px; font-size:13px;">${statusCell}</td>
+      <td style="padding:8px 10px; font-size:13px; text-align:right;">${timeCell}</td>
+      <td style="padding:8px 10px; text-align:right; white-space:nowrap;">
+        <button class="btn history-btn" data-id="${emp.id}" title="Break history" style="padding:4px 10px; font-size:11px; margin-right:6px;"><i class="ti ti-history" style="font-size:12px; vertical-align:-1px;"></i></button>
+        <button class="btn copy-btn" data-id="${emp.id}" title="Copy personal link" style="padding:4px 10px; font-size:11px;"><i class="ti ti-link" style="font-size:12px; vertical-align:-1px;"></i></button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  let linkRows = EMPLOYEES.map(e => `<tr style="border-bottom:1px solid #ece7db;">
+    <td style="padding:6px 8px; font-size:13px; font-weight:500; white-space:nowrap;">${e.name}</td>
+    <td style="padding:6px 8px; font-size:12px; word-break:break-all;" class="mono"><a href="${personalUrl(e.id)}" target="_blank" rel="noopener">${personalUrl(e.id)}</a></td>
+  </tr>`).join('');
+
+  app.innerHTML = `
+    ${configBanner()}
+    ${BOARD_KEY === 'REPLACE-ME' ? `<div style="background:#FAECE7; border:1px solid #e8b8a0; color:#993C1D; font-size:12px; padding:10px 14px; border-radius:8px; margin-bottom:1.25rem;">
+      <i class="ti ti-alert-triangle" style="font-size:14px; vertical-align:-2px; margin-right:6px;"></i>
+      You're still using the default board key — anyone who finds this file could guess it. Set your own <span class="mono">BOARD_KEY</span> before sharing links with the team.
+    </div>` : ''}
+    <div style="margin-bottom:1.25rem;">
+      <div style="font-family:'Oswald',sans-serif; font-size:20px; letter-spacing:0.3px; text-transform:uppercase;">Team break board</div>
+      <div style="font-size:12px; color:#8a8578;" class="mono">Lunch and dinner breaks are capped at 30 minutes · times turn red past the cap · click a row to open that person's page</div>
+      <div style="font-size:11px; color:#a32d2d; margin-top:4px;"><i class="ti ti-eye-off" style="font-size:12px; vertical-align:-1px;"></i> This board is for whoever manages the team — don't share this page's link itself. Share each person's own link instead (below).</div>
+    </div>
+    <div style="display:flex; gap:14px; margin-bottom:14px; font-size:12px; color:#5f5b4e; flex-wrap:wrap;">
+      ${Object.entries(BREAK_TYPES).map(([k,bt]) => `<div style="display:flex; align-items:center; gap:5px;"><span style="width:10px; height:10px; border-radius:2px; background:${bt.color}; display:inline-block;"></span>${bt.label}</div>`).join('')}
+    </div>
+    <div style="overflow-x:auto;">
+      <table style="width:100%; border-collapse:collapse; min-width:640px;">
+        <thead>
+          <tr style="border-bottom:1px solid #d8d3c4;">
+            <th style="text-align:left; padding:6px 10px; font-size:11px; color:#8a8578; font-weight:500;">Name</th>
+            <th style="text-align:left; padding:6px 10px; font-size:11px; color:#8a8578; font-weight:500;">Title</th>
+            <th style="text-align:left; padding:6px 10px; font-size:11px; color:#8a8578; font-weight:500;">Shift</th>
+            <th style="text-align:left; padding:6px 10px; font-size:11px; color:#8a8578; font-weight:500;">Status</th>
+            <th style="text-align:right; padding:6px 10px; font-size:11px; color:#8a8578; font-weight:500;">Elapsed</th>
+            <th style="text-align:right; padding:6px 10px; font-size:11px; color:#8a8578; font-weight:500;">Link</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div style="margin-top:1.5rem;">
+      <button id="toggle-links-btn" class="btn" style="font-size:12px; padding:8px 14px;">
+        <i class="ti ti-link" style="font-size:13px; vertical-align:-2px; margin-right:5px;"></i>Show personal links to share
+      </button>
+      <div id="links-panel" style="display:none; margin-top:12px; padding:14px 16px; background:#f7f5ef; border-radius:10px;">
+        <div style="font-size:11px; color:#8a8578; margin-bottom:10px;">Send each person only their own link below — never this board's link.</div>
+        <table style="width:100%; border-collapse:collapse;">${linkRows}</table>
+        <button id="copy-all-links-btn" class="btn" style="margin-top:12px; font-size:12px; padding:6px 12px;">
+          <i class="ti ti-copy" style="font-size:13px; vertical-align:-2px; margin-right:5px;"></i>Copy all as text
+        </button>
+      </div>
+    </div>
+  `;
+
+  app.querySelectorAll('.copy-btn').forEach(b => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      copyLink(personalUrl(b.getAttribute('data-id')), b);
+    };
+  });
+  app.querySelectorAll('.history-btn').forEach(b => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      location.hash = 'history-' + b.getAttribute('data-id');
+    };
+  });
+  app.querySelectorAll('.roster-row').forEach(r => {
+    r.onclick = () => { location.hash = r.getAttribute('data-id'); };
+  });
+
+  const toggleLinksBtn = app.querySelector('#toggle-links-btn');
+  const linksPanel = app.querySelector('#links-panel');
+  if (toggleLinksBtn) {
+    toggleLinksBtn.onclick = () => {
+      linksPanel.style.display = (linksPanel.style.display === 'none') ? 'block' : 'none';
+    };
+  }
+  const copyAllBtn = app.querySelector('#copy-all-links-btn');
+  if (copyAllBtn) {
+    copyAllBtn.onclick = () => {
+      const text = EMPLOYEES.map(e => `${e.name}: ${personalUrl(e.id)}`).join('\n');
+      copyLink(text, copyAllBtn);
+    };
+  }
+
+  restartTicker();
+}
+
+function tick() {
+  document.querySelectorAll('#timer, .board-timer').forEach(el => {
+    const started = parseInt(el.getAttribute('data-started'));
+    const limit = parseInt(el.getAttribute('data-limit'));
+    const elapsedMs = Date.now() - started;
+    el.textContent = fmtElapsed(elapsedMs);
+    const overLimit = elapsedMs > limit * 60000;
+    el.style.color = overLimit ? '#E24B4A' : (el.style.color || '');
+    if (overLimit) el.style.fontWeight = '500';
+  });
+}
+
+function restartTicker() {
+  if (tickHandle) clearInterval(tickHandle);
+  tick();
+  tickHandle = setInterval(tick, 1000);
+}
+
+function render() {
+  if (!loaded) return;
+  const route = getHashRoute();
+  if (route.view === 'personal') renderPersonal(route.id);
+  else if (route.view === 'history') renderHistory(route.id);
+  else if (route.view === 'board') renderBoard();
+  else renderBlocked();
+}
+
+window.addEventListener('hashchange', render);
+
+(async function init() {
+  await loadState();
+  render();
+  if (pollHandle) clearInterval(pollHandle);
+  pollHandle = setInterval(refreshFromStorage, POLL_MS);
+})();
+
+})();
+</script>
+</body>
+</html>
