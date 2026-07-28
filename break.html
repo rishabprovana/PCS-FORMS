@@ -80,6 +80,7 @@ let loaded = false;
 let tickHandle = null;
 let pollHandle = null;
 const recentLocalWrites = {}; // empId -> timestamp of our last local start/stop, to avoid poll clobbering our own optimistic update
+const pendingWrites = {}; // empId -> true while our last save hasn't been confirmed to have reached the database
 
 function empById(id) { return EMPLOYEES.find(e => e.id === id); }
 function defaultRecord() { return { status: 'idle', breakType: null, startedAt: null, log: [] }; }
@@ -128,15 +129,21 @@ async function fetchRecord(id) {
 }
 
 async function pushRecord(id, rec) {
-  if (!configured) { localSet(id, rec); return; }
+  if (!configured) { localSet(id, rec); return true; }
   try {
-    await fetch(`${DATABASE_URL}/employees/${id}.json`, {
+    const res = await fetch(`${DATABASE_URL}/employees/${id}.json`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(rec)
     });
+    if (!res.ok) {
+      console.error('save failed - HTTP', res.status, 'for', id, '- check your Firebase Database Rules allow public read/write, and that DATABASE_URL is correct.');
+      return false;
+    }
+    return true;
   } catch (e) {
     console.error('save failed', e);
+    return false;
   }
 }
 
@@ -151,8 +158,8 @@ async function loadState() {
   const now = Date.now();
   results.forEach(([id, rec]) => {
     if (rec === null) { ensureRecord(id); return; }
-    const recentlyTouchedLocally = recentLocalWrites[id] && (now - recentLocalWrites[id] < 4000);
-    if (recentlyTouchedLocally) return;
+    const recentlyTouchedLocally = recentLocalWrites[id] && (now - recentLocalWrites[id] < POLL_MS * 2);
+    if (recentlyTouchedLocally || pendingWrites[id]) return;
     data.employees[id] = rec;
   });
   loaded = true;
@@ -160,7 +167,9 @@ async function loadState() {
 
 async function saveRecord(id) {
   recentLocalWrites[id] = Date.now();
-  await pushRecord(id, data.employees[id]);
+  const ok = await pushRecord(id, data.employees[id]);
+  if (ok) delete pendingWrites[id];
+  else pendingWrites[id] = true;
 }
 
 async function refreshFromStorage() {
@@ -233,12 +242,20 @@ function copyLink(url, btn) {
 }
 
 function configBanner() {
-  if (configured) return '';
-  return `<div style="background:#FAEEDA; border:1px solid #e8d3a0; color:#7a5b16; font-size:12px; padding:10px 14px; border-radius:8px; margin-bottom:1.25rem;">
-    <i class="ti ti-plug-connected-x" style="font-size:14px; vertical-align:-2px; margin-right:6px;"></i>
-    Not connected to a shared database yet — this browser is only showing local data that won't sync with your team.
-    See README.md to connect Firebase.
-  </div>`;
+  if (!configured) {
+    return `<div style="background:#FAEEDA; border:1px solid #e8d3a0; color:#7a5b16; font-size:12px; padding:10px 14px; border-radius:8px; margin-bottom:1.25rem;">
+      <i class="ti ti-plug-connected-x" style="font-size:14px; vertical-align:-2px; margin-right:6px;"></i>
+      Not connected to a shared database yet — this browser is only showing local data that won't sync with your team.
+      See README.md to connect Firebase.
+    </div>`;
+  }
+  if (Object.keys(pendingWrites).length) {
+    return `<div style="background:#FAECE7; border:1px solid #e8b8a0; color:#993C1D; font-size:12px; padding:10px 14px; border-radius:8px; margin-bottom:1.25rem;">
+      <i class="ti ti-alert-triangle" style="font-size:14px; vertical-align:-2px; margin-right:6px;"></i>
+      Couldn't save the latest change(s) to the shared database — check that your Firebase Database Rules allow public read/write, and that DATABASE_URL is correct. Until this is fixed, break status may reset on other devices.
+    </div>`;
+  }
+  return '';
 }
 
 function renderBlocked() {
