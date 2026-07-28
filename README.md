@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/30459854/README.md)
 # Team Break Board — Setup
 
 This app is a single static HTML file (`break.html`). It has no server of its
